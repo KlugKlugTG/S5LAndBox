@@ -578,6 +578,25 @@ fun EmulatorScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+
+                /* The status line already says how fast the machine runs; this
+                 * answers the other question first — is the guest actually on
+                 * the network? Off, negotiating, or up with live flows. */
+                val net = current?.network
+                if (current != null && !current.idle && net != null) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = when {
+                            !net.attached -> "net: off"
+                            !net.onNetwork -> "net: linking"
+                            !net.nat -> "net: ppp up (no routing)"
+                            else -> "net up · ${net.liveFlows} flows · ↓${formatBytes(net.rxBytes)}"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
             }
 
             ButtonBar(repository = repository)

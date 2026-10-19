@@ -33,12 +33,12 @@
 #include "usb_host.h"
 
 #include "VMButtonQueue.h"
+#include "VMDiskSize.h"
 #include "VMFirmwareBoot.h"
 #include "VMFirmwareImport.h"
 #include "VMFirmwareKeys.h"
 #include "VMGuest.h"
 #include "VMGuestInstallBuild.h"
-#include "VMDiskSize.h"
 #include "engine_ipa.h"
 #include "VMGuestPackageManifest.h"
 #include "VMInstancePaths.h"
@@ -113,6 +113,21 @@ struct engine {
     double fps_window_start;
     uint64_t fps_window_frames;
     arm_status_t last_arm_status;
+
+    /* Guest-network witnesses, copied on the machine thread at the same
+     * publish boundary the frame and counters use. Zeroed until a network
+     * session attaches, so a status read can always answer "is the guest on
+     * the network" with a real observation rather than a guess. */
+    bool network_attached;
+    bool network_nat;
+    bool network_ppp_up;
+    uint64_t network_dns_queries;
+    uint64_t network_dns_answered;
+    uint64_t network_dns_timeouts;
+    uint64_t network_tcp_established;
+    uint64_t network_rx_bytes;
+    uint64_t network_tx_bytes;
+    unsigned network_tcp_live;
 
     uint8_t *snapshot;
     bool have_frame;
@@ -322,15 +337,11 @@ done:
 
 static bool write_marker(const char *path)
 {
-    static const char text[] = "restore\n";
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
-    bool ok;
-    if (fd < 0) return false;
-    ok = write(fd, text, sizeof text - 1u) == (ssize_t)(sizeof text - 1u);
-    if (ok && fsync(fd) != 0) ok = false;
-    close(fd);
-    if (!ok) unlink(path);
-    return ok;
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    fputs("restore\n", f);
+    return fclose(f) == 0;
 }
 
 static void make_instance_id(engine_t *e, char *out)
@@ -1150,6 +1161,7 @@ int engine_machine_create(engine_t *engine, const char *name,
         make_instance_id(e, id);
         if (instance_index_locked(e, id) < 0) break;
     }
+
     st = vm_instance_add(&e->instances, id, trimmed, values, count,
                          engine_unix_now(), NULL);
     if (st == VM_INSTANCE_OK) {
@@ -1418,6 +1430,8 @@ int engine_machine_options_json(engine_t *engine, const char *id,
     engine_t *e = engine;
     vm_instance_t instance;
     bool found = false;
+    bool ppp_provisioned = false;
+    uint64_t disk_bytes = 0;
     unsigned count, i;
     json_t j;
 
@@ -1432,6 +1446,27 @@ int engine_machine_options_json(engine_t *engine, const char *id,
     }
     pthread_mutex_unlock(&e->lock);
 
+    /*
+     * The switches below say what the next boot will ask for; these two
+     * witnesses say what the machine's image can actually deliver. The PPP
+     * record is written when the work image is made, so a machine created
+     * before the record existed can show "on" without ever coming up --
+     * that mismatch is exactly what the settings card should surface.
+     */
+    if (found) {
+        vm_instance_paths_t paths;
+        vm_firmware_boot_paths_t boot_paths;
+        char marker[ENGINE_PATH_CAP];
+        if (vm_instance_paths_derive(e->firmware, e->machines, id, &paths) ==
+                VM_INSTANCE_PATHS_OK) {
+            vm_instance_paths_to_boot(&paths, &boot_paths);
+            if (join_path(marker, sizeof marker, boot_paths.work,
+                          VM_FW_BOOT_PPP_FILE))
+                ppp_provisioned = file_present(marker, NULL);
+            vm_disk_size_read(paths.machine, &disk_bytes);
+        }
+    }
+
     count = vm_option_count();
     if (count > VM_INSTANCE_OPTION_MAX) count = VM_INSTANCE_OPTION_MAX;
     json_reset(&j, out, capacity);
@@ -1443,7 +1478,10 @@ int engine_machine_options_json(engine_t *engine, const char *id,
         if (i) json_raw(&j, ",");
         json_raw(&j, value ? "true" : "false");
     }
-    json_raw(&j, "]}");
+    json_printf(&j, "],\"pppProvisioned\":%s,\"diskGiB\":%llu}",
+                ppp_provisioned ? "true" : "false",
+                disk_bytes > 0 ? (unsigned long long)(disk_bytes / VM_DISK_GIB)
+                               : 0ull);
     return (int)j.len;
 }
 
@@ -1936,6 +1974,9 @@ static void publish_retired(engine_t *e, s5l8900_t *machine,
                                          &stride, &order);
     size_t bytes = 0;
     double now = engine_now();
+    vm_network_status_t network_snapshot;
+
+    memset(&network_snapshot, 0, sizeof network_snapshot);
 
     if (!fb || width == 0 || height == 0 ||
         stride < (size_t)width * VM_FB_BPP ||
@@ -1946,6 +1987,21 @@ static void publish_retired(engine_t *e, s5l8900_t *machine,
         bytes = (size_t)stride * height;
     }
 
+    /*
+     * The network session lives behind the boot object, and both are owned
+     * by this thread; the counters are read between chunks, when nothing is
+     * executing -- the same machine-thread boundary the iOS engine uses.  A
+     * detached session zeros every counter, which reads as "not on the
+     * network yet": an observation, not a guess.
+     */
+    {
+        vm_firmware_boot_t *boot;
+        pthread_mutex_lock(&e->lock);
+        boot = e->boot;
+        pthread_mutex_unlock(&e->lock);
+        (void)vm_firmware_boot_network_status(boot, &network_snapshot);
+    }
+
     pthread_mutex_lock(&e->lock);
     if (machine->uart0.tx_len > 0) {
         size_t captured = machine->uart0.tx_len;
@@ -1953,6 +2009,16 @@ static void publish_retired(engine_t *e, s5l8900_t *machine,
         console_append_len_locked(e, machine->uart0.tx, captured);
         machine->uart0.tx_len = 0;
     }
+    e->network_attached = network_snapshot.attached;
+    e->network_nat = network_snapshot.nat_enabled;
+    e->network_ppp_up = network_snapshot.lcp_open && network_snapshot.ipcp_open;
+    e->network_dns_queries = network_snapshot.dns_queries;
+    e->network_dns_answered = network_snapshot.dns_answered;
+    e->network_dns_timeouts = network_snapshot.dns_timeouts;
+    e->network_tcp_established = network_snapshot.tcp_established;
+    e->network_rx_bytes = network_snapshot.tcp_bytes_to_guest;
+    e->network_tx_bytes = network_snapshot.tcp_bytes_to_host;
+    e->network_tcp_live = network_snapshot.tcp_live_flows;
     if (fb && e->snapshot) {
         uint32_t guest_width = width, guest_height = height;
         bool changed = !e->have_frame || e->snapshot_blank ||
@@ -2050,6 +2116,16 @@ static void engine_thread_main(engine_t *e)
     }
 
     ready = install_payload(e, machine, &boot);
+    /*
+     * The thread owns the boot object from here; publishing it lets the
+     * network witnesses in publish_retired reach the session (and lets
+     * engine_stop clear it before the object is destroyed).
+     */
+    if (boot) {
+        pthread_mutex_lock(&e->lock);
+        e->boot = boot;
+        pthread_mutex_unlock(&e->lock);
+    }
     if (!ready) {
         s5l8900_free(machine);
         free(machine);
@@ -2063,7 +2139,6 @@ static void engine_thread_main(engine_t *e)
         pthread_mutex_unlock(&e->lock);
         return;
     }
-
     if (e->audio_ok) {
         machine->i2s[0].frame = vm_audio_guest_frame;
         machine->i2s[0].frame_ctx = &e->audio;
@@ -2239,6 +2314,12 @@ static void engine_thread_main(engine_t *e)
         usb_host_disconnect(&e->usb_host, machine);
     }
 
+    /* Retire the published pointer before the object it names is freed, so
+     * no status read can ever observe a destroyed boot. */
+    pthread_mutex_lock(&e->lock);
+    e->boot = NULL;
+    pthread_mutex_unlock(&e->lock);
+
     s5l8900_free(machine);
     free(machine);
     vm_firmware_boot_destroy(&boot);
@@ -2267,7 +2348,6 @@ static void engine_thread_main(engine_t *e)
     e->preparing_root = false;
     e->usb_active = false;
     e->usb_ready = false;
-    e->boot = NULL;
     e->phase = PHASE_IDLE;
     e->instance_id[0] = '\0';
     e->machine_log_path[0] = '\0';
@@ -2447,6 +2527,16 @@ int engine_start(engine_t *engine, const char *instance_id,
     e->fps = 0.0;
     e->fps_window_start = 0.0;
     e->fps_window_frames = 0;
+    e->network_attached = false;
+    e->network_nat = false;
+    e->network_ppp_up = false;
+    e->network_dns_queries = 0;
+    e->network_dns_answered = 0;
+    e->network_dns_timeouts = 0;
+    e->network_tcp_established = 0;
+    e->network_rx_bytes = 0;
+    e->network_tx_bytes = 0;
+    e->network_tcp_live = 0;
     e->have_frame = false;
     e->snapshot_fresh = false;
     e->snapshot_blank = false;
@@ -2553,6 +2643,10 @@ int engine_status_json(engine_t *engine, char *out, size_t capacity)
     double rate, fps;
     arm_status_t arm_status;
     size_t console_len;
+    bool net_attached, net_nat, net_ppp_up;
+    uint64_t net_dns_q, net_dns_ok, net_dns_to, net_tcp;
+    uint64_t net_rx, net_tx;
+    unsigned net_live;
 
     if (!e || !out || capacity == 0) return -1;
     pthread_mutex_lock(&e->lock);
@@ -2571,6 +2665,16 @@ int engine_status_json(engine_t *engine, char *out, size_t capacity)
     fps_frames = e->fps_window_frames;
     arm_status = e->last_arm_status;
     console_len = e->console_len;
+    net_attached = e->network_attached;
+    net_nat = e->network_nat;
+    net_ppp_up = e->network_ppp_up;
+    net_dns_q = e->network_dns_queries;
+    net_dns_ok = e->network_dns_answered;
+    net_dns_to = e->network_dns_timeouts;
+    net_tcp = e->network_tcp_established;
+    net_rx = e->network_rx_bytes;
+    net_tx = e->network_tx_bytes;
+    net_live = e->network_tcp_live;
     pthread_mutex_unlock(&e->lock);
 
     done = atomic_load(&e->prepare_done);
@@ -2595,12 +2699,21 @@ int engine_status_json(engine_t *engine, char *out, size_t capacity)
     json_printf(&j,
         ",\"retired\":%llu,\"rate\":%.3f,\"fps\":%.3f,\"fpsFrames\":%llu,"
         "\"prepareDone\":%llu,\"prepareTotal\":%llu,\"cpuStatus\":%d,"
-        "\"usb\":%s,\"audio\":%s,\"consolePending\":%zu}",
+        "\"usb\":%s,\"audio\":%s,\"consolePending\":%zu,"
+        "\"network\":{\"attached\":%s,\"nat\":%s,\"pppUp\":%s,"
+        "\"dnsQueries\":%llu,\"dnsAnswered\":%llu,\"dnsTimeouts\":%llu,"
+        "\"tcpEstablished\":%llu,\"liveFlows\":%u,\"rxBytes\":%llu,"
+        "\"txBytes\":%llu}}",
         (unsigned long long)retired, rate, fps,
         (unsigned long long)fps_frames,
         (unsigned long long)done, (unsigned long long)total, (int)arm_status,
         usb_ready ? "true" : "false", e->audio_ok ? "true" : "false",
-        console_len);
+        console_len,
+        net_attached ? "true" : "false", net_nat ? "true" : "false",
+        net_ppp_up ? "true" : "false",
+        (unsigned long long)net_dns_q, (unsigned long long)net_dns_ok,
+        (unsigned long long)net_dns_to, (unsigned long long)net_tcp,
+        net_live, (unsigned long long)net_rx, (unsigned long long)net_tx);
     return (int)j.len;
 }
 

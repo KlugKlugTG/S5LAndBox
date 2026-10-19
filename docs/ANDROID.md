@@ -52,13 +52,46 @@ directly; neither is a store artifact.
 | Snapshots (create, restore, delete) | Yes |
 | Audio output (48 kHz stereo) | Yes |
 | Guest console (`uart0`) | Yes |
-| Guest networking | Through the portable boot layer, given `INTERNET` |
+| Guest networking | Through the portable boot layer, given `INTERNET`; link state, DNS and flow counters are published to the status line and Settings |
 | Pause and resume, checkpoints | Yes |
 | Save/restore an older snapshot | Yes, including disk copy-on-write replay |
 | USB services: guest files (AFC), IPA install | Not yet |
-| Cydia / package installation | Not yet |
+| Cydia / package installation | Not yet; the first-run reorganization completes on a fresh machine, but repository refresh needs TLS the guest does not have |
 | Microphone capture | Not yet; the option only toggles the guest side |
 | Background execution | The machine pauses when the app is stopped |
+
+## Guest internet
+
+Networking comes from the portable boot layer, exactly as on the iOS app: a
+PPP peer on `uart4` inside the machine, routed to the device's own connection
+through the NAT in the core's packet bridge. It needs the `INTERNET`
+permission (already in the manifest) and the two switches under **OPTIONS →
+Guest state** — *Guest networking (PPP over uart4)* and *Route guest traffic
+to the internet* — which are read when the machine starts. A machine on the
+internet has real connectivity: plain-HTTP pages and repositories load.
+
+Two things made it look dead from the outside, and both are addressed here:
+
+- **It was invisible.** The engine now copies the session's link state, DNS
+  queries/answers/timeouts, live TCP flows and byte counters to the status
+  surface at the same publish boundary the frame uses. The emulator's status
+  line shows `net: off`, `net: linking`, or `net up · N flows · ↓M`, and
+  Settings shows a **Guest internet** card with the same numbers plus two
+  image-level witnesses: whether PPP is actually provisioned in this
+  machine's work image, and its disk capacity.
+- **Old machines were too small.** Machines created by earlier builds have no
+  `disk-size-v1` record, so provisioning keeps the legacy (small) image —
+  which is exactly what stalls Cydia's first-run "Reorganizing — will
+  automatically close when done" screen, since the reorganization needs free
+  room on the volume. The machine picker now offers 2/4/8 GiB volumes at
+  creation (sparse: the first boot still copies only ~450 MB). Machines made
+  before the picker existed keep their legacy record — the honest fix is a
+  fresh machine with a larger volume.
+
+One limitation is inherent to the guest, not the port: iPhone OS 3.1.3's TLS
+is too old for today's servers, so plain-HTTP sites and repositories load
+while HTTPS generally does not. Terminating TLS on the host side (a proxy plus
+a guest CA) is upstream's unbuilt networking milestone, not an Android gap.
 
 ## Storage
 
@@ -71,6 +104,7 @@ Android/data/com.tayga16.s5landbox/files/
   Machines/
     instances.txt           machine names, options and last-opened time
     <id>/
+      disk-size-v1          capacity record read at provisioning (picker: 2/4/8 GiB)
       rootfs-work.img       this machine's writable disk
       state.snap            latest checkpoint RAM (when stopped with a checkpoint)
       state.snap.mdstate    disk-bridge sidecar for that checkpoint

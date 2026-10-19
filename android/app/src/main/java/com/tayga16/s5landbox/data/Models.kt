@@ -40,6 +40,34 @@ data class FirmwareState(
     val lastReport: String,
 )
 
+/**
+ * Guest-network witnesses, copied at the machine-thread boundary. attached
+ * with pppUp false means the session exists but the link is still coming up
+ * (LCP/IPCP); every counter is zero until then, so an empty object is a real
+ * "not on the network" answer, not a guess.
+ */
+data class NetworkStatus(
+    val attached: Boolean = false,
+    val nat: Boolean = false,
+    val pppUp: Boolean = false,
+    val dnsQueries: Long = 0L,
+    val dnsAnswered: Long = 0L,
+    val dnsTimeouts: Long = 0L,
+    val tcpEstablished: Long = 0L,
+    val liveFlows: Int = 0,
+    val rxBytes: Long = 0L,
+    val txBytes: Long = 0L,
+) {
+    val onNetwork: Boolean get() = attached && pppUp
+}
+
+/** Values plus the image-level witnesses the settings card pairs with them. */
+data class MachineOptions(
+    val values: BooleanArray,
+    val pppProvisioned: Boolean,
+    val diskGiB: Long,
+)
+
 data class EngineStatus(
     val phase: String,
     val phaseCode: Int,
@@ -59,6 +87,7 @@ data class EngineStatus(
     val usb: Boolean,
     val audio: Boolean,
     val consolePending: Long,
+    val network: NetworkStatus = NetworkStatus(),
 ) {
     val idle: Boolean get() = phase == "idle"
     val stopping: Boolean get() = phase == "stopping"

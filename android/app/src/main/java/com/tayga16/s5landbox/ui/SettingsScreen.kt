@@ -41,6 +41,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.unit.dp
 import com.tayga16.s5landbox.data.EngineRepository
 import com.tayga16.s5landbox.data.EngineStatus
+import com.tayga16.s5landbox.data.MachineOptions
+import com.tayga16.s5landbox.data.NetworkStatus
+import com.tayga16.s5landbox.data.OptionRow
 import com.tayga16.s5landbox.data.OptionsCatalog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -61,6 +64,7 @@ fun SettingsScreen(
     var catalog by remember { mutableStateOf<OptionsCatalog?>(null) }
     var values by remember { mutableStateOf(BooleanArray(0)) }
     var savedValues by remember { mutableStateOf(BooleanArray(0)) }
+    var machineOptions by remember { mutableStateOf<MachineOptions?>(null) }
     var status by remember { mutableStateOf<EngineStatus?>(null) }
     var loading by remember { mutableStateOf(true) }
     var saving by remember { mutableStateOf(false) }
@@ -71,13 +75,15 @@ fun SettingsScreen(
         val loaded = withContext(Dispatchers.IO) {
             val machine = repository.machines().firstOrNull { it.id == machineId }
             val options = repository.options()
-            val stored = repository.machineValues(machineId)
-            Triple(machine?.name ?: "Machine", options, stored)
+            val machineOptions = repository.machineOptions(machineId)
+            Triple(machine?.name ?: "Machine", options, machineOptions)
         }
         machineName = loaded.first
         catalog = loaded.second
+        machineOptions = loaded.third
         val fallback = loaded.second.options.map { it.default }.toBooleanArray()
-        val current = if (loaded.third.size == fallback.size) loaded.third else fallback
+        val current =
+            if (loaded.third.values.size == fallback.size) loaded.third.values else fallback
         values = current
         savedValues = current.copyOf()
         loading = false
@@ -174,6 +180,17 @@ fun SettingsScreen(
                     )
                 }
             }
+
+            /* The switches under OPTIONS say what the next boot will ask for;
+             * this card pairs them with what the machine's image can actually
+             * deliver, so "on" never silently means "still offline". */
+            GuestInternetCard(
+                values = values,
+                options = options.options,
+                witnesses = machineOptions,
+                runningHere = runningHere,
+                live = status?.takeIf { !it.idle && it.instanceId == machineId }?.network,
+            )
 
             Text(
                 text = "OPTIONS",
@@ -273,6 +290,79 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(24.dp))
         }
+        }
+    }
+}
+
+@Composable
+private fun GuestInternetCard(
+    values: BooleanArray,
+    options: List<OptionRow>,
+    witnesses: MachineOptions?,
+    runningHere: Boolean,
+    live: NetworkStatus?,
+) {
+    val pppIndex = options.indexOfFirst { it.name == "ppp" }
+    val natIndex = options.indexOfFirst { it.name == "nat" }
+    val pppOn = pppIndex >= 0 && values.getOrElse(pppIndex) { false }
+    val natOn = natIndex >= 0 && values.getOrElse(natIndex) { false }
+    val pppProvisioned = witnesses?.pppProvisioned ?: false
+    val diskGiB = witnesses?.diskGiB ?: 0L
+
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(20.dp)) {
+            Text("Guest internet", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = when {
+                    runningHere && live != null && live.onNetwork ->
+                        "On the network now — PPP is up" +
+                            (if (live.nat) " and traffic is routed" else "") + "."
+                    runningHere && live != null && live.attached ->
+                        "PPP is negotiating; the link has not come up yet."
+                    pppOn && pppProvisioned ->
+                        "Ready. The link comes up when this machine starts."
+                    pppProvisioned ->
+                        "The image supports it, but the networking switch is off."
+                    else ->
+                        "This machine's image was made without the guest-network " +
+                            "record, so it can never link. Create a fresh machine."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            if (runningHere && live != null && live.onNetwork) {
+                Text(
+                    text = "DNS ${live.dnsAnswered}/${live.dnsQueries} answered" +
+                        (if (live.dnsTimeouts > 0) " · ${live.dnsTimeouts} timed out" else "") +
+                        " · ${live.tcpEstablished} TCP flows" +
+                        " · ↓ ${formatBytes(live.rxBytes)} ↑ ${formatBytes(live.txBytes)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "PPP in this image: ${if (pppProvisioned) "yes" else "no"} · " +
+                    "NAT routing: ${if (natOn) "on" else "off"} · " +
+                    "disk capacity: " +
+                    (if (diskGiB > 0) "$diskGiB GiB" else "legacy (small)"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            Text(
+                text = "Plain HTTP sites and repositories load. HTTPS generally does " +
+                    "not: iPhone OS 3.1.3 speaks a TLS too old for today's servers " +
+                    "(the TLS proxy is an upstream project, not yet built).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
         }
     }
 }

@@ -170,10 +170,17 @@ class EngineRepository(private val handle: Long) {
         return OptionsCatalog(groups, rows)
     }
 
-    fun machineValues(id: String): BooleanArray {
+    fun machineValues(id: String): BooleanArray = machineOptions(id).values
+
+    /** The switches plus what the machine's image can actually deliver. */
+    fun machineOptions(id: String): MachineOptions {
         val o = json(NativeEngine.nativeMachineOptionsJson(handle, id))
-        val array = o.optJSONArray("values") ?: return BooleanArray(0)
-        return BooleanArray(array.length()) { array.optBoolean(it, false) }
+        val array = o.optJSONArray("values") ?: BooleanArray(0)
+        return MachineOptions(
+            values = BooleanArray(array.length()) { array.optBoolean(it, false) },
+            pppProvisioned = o.optBoolean("pppProvisioned", false),
+            diskGiB = o.optLong("diskGiB", 0L),
+        )
     }
 
     fun setMachineValues(id: String, values: BooleanArray): BindResult =
@@ -212,6 +219,20 @@ class EngineRepository(private val handle: Long) {
             usb = o.optBoolean("usb", false),
             audio = o.optBoolean("audio", false),
             consolePending = o.optLong("consolePending", 0L),
+            network = o.optJSONObject("network")?.let { n ->
+                NetworkStatus(
+                    attached = n.optBoolean("attached", false),
+                    nat = n.optBoolean("nat", false),
+                    pppUp = n.optBoolean("pppUp", false),
+                    dnsQueries = n.optLong("dnsQueries", 0L),
+                    dnsAnswered = n.optLong("dnsAnswered", 0L),
+                    dnsTimeouts = n.optLong("dnsTimeouts", 0L),
+                    tcpEstablished = n.optLong("tcpEstablished", 0L),
+                    liveFlows = n.optInt("liveFlows", 0),
+                    rxBytes = n.optLong("rxBytes", 0L),
+                    txBytes = n.optLong("txBytes", 0L),
+                )
+            } ?: NetworkStatus(),
         )
     }
 
