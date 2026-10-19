@@ -10,6 +10,7 @@
 #include "rootfs_work.h"
 #include "sha256.h"
 
+#include <android/log.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -730,18 +731,16 @@ int engine_ipa_install_path(const char *machine_directory,
                 entries[ecount].permissions = 0755;
                 entries[ecount].existing_policy = ROOTFS_WORK_EXISTING_REUSE_DIRECTORY;
             } else if (vm_ipa_entry_is_symlink(&plan.files[i])) {
-                unsigned cidx = plan.content_indices[i];
                 entries[ecount].kind = ROOTFS_WORK_ENTRY_SYMLINK;
-                entries[ecount].content = packed_bytes + offsets[cidx];
-                entries[ecount].content_size = (size_t)plan.files[cidx].uncompressed_size;
+                entries[ecount].content = packed_bytes + offsets[i];
+                entries[ecount].content_size = (size_t)plan.files[i].uncompressed_size;
                 entries[ecount].permissions = 0777;
                 entries[ecount].existing_policy = ROOTFS_WORK_EXISTING_REFUSE;
             } else {
-                unsigned cidx = plan.content_indices[i];
                 entries[ecount].kind = ROOTFS_WORK_ENTRY_FILE;
-                entries[ecount].content = packed_bytes + offsets[cidx];
-                entries[ecount].content_size = (size_t)plan.files[cidx].uncompressed_size;
-                entries[ecount].permissions = ((plan.files[cidx].unix_mode & 0111u) || cidx == exec_idx) ? 0755 : 0644;
+                entries[ecount].content = packed_bytes + offsets[i];
+                entries[ecount].content_size = (size_t)plan.files[i].uncompressed_size;
+                entries[ecount].permissions = ((plan.files[i].unix_mode & 0111u) || i == exec_idx) ? 0755 : 0644;
                 entries[ecount].existing_policy = ROOTFS_WORK_EXISTING_REFUSE;
             }
             ecount++;
@@ -761,17 +760,22 @@ int engine_ipa_install_path(const char *machine_directory,
         entries[unique++] = entries[i];
     }
 
-    /* 6. Repair clone and provision */
+    /* 6. Repair clone (best effort) and provision */
     rootfs_work_result_t rw_result;
     bool provision_ok = false;
-    if (rootfs_work_repair_powered_off_clone(stage_img, &rw_result) == ROOTFS_WORK_OK) {
-        if (rootfs_work_provision_clone(stage_img, entries, unique, true, &rw_result) == ROOTFS_WORK_OK) {
-            provision_ok = true;
-        } else {
-            if (detail && detail_capacity) snprintf(detail, detail_capacity, "Provision failed: %s", rw_result.detail);
-        }
+    rootfs_work_status_t repair_st = rootfs_work_repair_powered_off_clone(stage_img, &rw_result);
+    if (repair_st != ROOTFS_WORK_OK) {
+        /* Powered-off allocation recovery is only supported when the extents-overflow
+         * tree is empty. If the guest disk has fragmented files or active overflow extents,
+         * skip repair and proceed directly with provisioning (allow_unclean=true). */
+        __android_log_print(ANDROID_LOG_WARN, "S5LAndBox",
+            "engine_ipa: repair clone skipped (%s), proceeding to provision",
+            rw_result.detail[0] ? rw_result.detail : "unsupported repair state");
+    }
+    if (rootfs_work_provision_clone(stage_img, entries, unique, true, &rw_result) == ROOTFS_WORK_OK) {
+        provision_ok = true;
     } else {
-        if (detail && detail_capacity) snprintf(detail, detail_capacity, "Repair clone failed: %s", rw_result.detail);
+        if (detail && detail_capacity) snprintf(detail, detail_capacity, "Provision failed: %s", rw_result.detail);
     }
 
     /* Free entries */
