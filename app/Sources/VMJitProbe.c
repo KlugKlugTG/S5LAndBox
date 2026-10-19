@@ -11,6 +11,9 @@
 #  ifndef _POSIX_C_SOURCE
 #    define _POSIX_C_SOURCE 200809L
 #  endif
+#  if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#    define _DEFAULT_SOURCE 1 /* MAP_ANONYMOUS beside strict POSIX */
+#  endif
 #  if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #    define _DARWIN_C_SOURCE 1   /* MAP_ANON, MAP_JIT */
 #  endif
