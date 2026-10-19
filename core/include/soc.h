@@ -1063,6 +1063,32 @@ typedef struct {
      */
     bool     complete_rejected_submits;
     /*
+     * THE BEST-EFFORT GENERAL TA RENDERER (the HyperHLE-style policy).
+     *
+     * The strict decoders above are evidence-gated and fail closed, which is
+     * the correct default for a harness and the wrong one for a product that
+     * wants an OpenGL ES game to draw anything at all: every general-perspective,
+     * per-vertex-colour or unknown-control form a real game submits is a
+     * strict rejection, so with only the strict path plus liveness the guest
+     * runs and the screen stays empty.
+     *
+     * When this flag is set, after every strict family has declined a
+     * STARTRENDER the device makes one best-effort pass over the SAME staged
+     * TA stream with a generalised parser (any vertex count, any perspective,
+     * per-vertex colours, unknown control/sampler words skipped rather than
+     * rejected) and a scanline triangle rasteriser. Whatever it can decode it
+     * renders; whatever it cannot it skips and counts in the trace. It never
+     * runs before the strict families, so the exactly-modelled UI forms keep
+     * their pixel-exact path and this only ever sees forms that would otherwise
+     * be a rejection.
+     *
+     * Same rules as complete_rejected_submits: host policy, deliberately absent
+     * from snap_mbx(), survives a device reset, fits the existing padding
+     * before `edram` so sizeof(s5l_mbx_t) and the v32 snapshot layout do not
+     * move.
+     */
+    bool     hle_renderer;
+    /*
      * Owned by the machine, exactly as m->ram is, and NOT part of this struct's
      * bytes -- 16 MB inside a snapshot-guarded struct would be absurd. Survives
      * s5l_mbx_reset(), which zeroes the contents rather than dropping them.
@@ -1082,6 +1108,7 @@ typedef struct {
 #define S5L_MBX_3D_ACCEPT_SPRITE 3u
 #define S5L_MBX_3D_ACCEPT_SOLID  4u
 #define S5L_MBX_3D_ACCEPT_TA_STREAM 5u
+#define S5L_MBX_3D_ACCEPT_TA_HLE    6u
 
 /* Host-only evidence for one fail-closed STARTRENDER. Four records cover the
  * complete burst observed during the SpringBoard-to-Settings transition.
@@ -1206,6 +1233,13 @@ void     s5l_mbx_reset(s5l_mbx_t *m);
  * counts those non-rendering completions separately. The setting survives a
  * device reset and is never loaded from a guest snapshot. */
 bool     s5l_mbx_set_degraded_completion(s5l_mbx_t *m, bool enabled);
+/* Select the best-effort general TA renderer policy. Disabled keeps the
+ * strict-only decode. Enabled additionally attempts a generalised decode of
+ * any STARTRENDER every strict family rejected, rendering what it understands
+ * and skipping the rest; a scene it fully fails falls through to the ordinary
+ * rejection (and to complete_rejected_submits if that is also enabled). The
+ * setting survives a device reset and is never loaded from a guest snapshot. */
+bool     s5l_mbx_set_hle_renderer(s5l_mbx_t *m, bool enabled);
 uint32_t s5l_mbx_read(s5l_mbx_t *m, uint32_t off);
 void     s5l_mbx_write(s5l_mbx_t *m, uint32_t off, uint32_t val);
 /* Called immediately before s5l_mbx_write() for the same store. TA command

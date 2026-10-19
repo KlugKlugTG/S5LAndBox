@@ -5142,6 +5142,700 @@ static void mbx_capture_3d_accept(
     if (witness->record_valid_words) witness->record_hash = hash;
 }
 
+/* ===================================================================
+ * THE BEST-EFFORT GENERAL TA RENDERER (hle_renderer policy).
+ *
+ * Design source: HyperHLE-Fork's GLES1 layer. HyperHLE runs the guest's
+ * OpenGL ES calls on a host pipeline that renders what it understands and
+ * approximates the rest, and its game-compatibility record (N.O.V.A. 3,
+ * Real Racing, Asphalt, Geometry Dash on 2008-era software) comes from that
+ * ordering of priorities. This section transplants that policy onto the
+ * MBX's already-staged TA stream: the strict families above stay first and
+ * keep every exactly-modelled UI form pixel-exact; this pass runs only on
+ * forms they rejected, which is precisely the set a GLES1 game produces
+ * (arbitrary perspective, per-vertex colours, triangle lists, control and
+ * sampler words the strict tables have never measured).
+ *
+ * WHAT IT GENERALISES, each item being a strict rejection it replaces:
+ *   - any vertex count per primitive (fan-triangulated), not only four;
+ *   - any finite screen z and any positive finite reciprocal w, with
+ *     perspective-correct UV by interpolating u*rw, v*rw and rw barycentrically
+ *     and dividing -- the exact shape of the measured sprite denominator
+     * formula, applied per pixel;
+ *   - per-vertex BGRA8 colours, interpolated (Gouraud), not only uniform grey;
+ *   - unknown control words, sampler words and inter-draw blocks are SKIPPED
+ *     with a trace count instead of failing the scene;
+ *   - textures decode through the measured field layout (width/height/pitch/
+ *     address/filtered) without the expected-value match, so any driver-built
+ *     texture words render.
+ *
+ * WHAT IT DELIBERATELY KEEPS STRICT, because inventing them would corrupt
+ * memory rather than approximate pixels: the target register set (BGRA8,
+ * FBSTART/FBLINESTRIDE/FBXCLIP/FBYCLIP), the GART-backed reads and the
+ * validate-then-commit write discipline, and the staging of textures into
+ * host memory before any destination byte is touched.
+ *
+ * Pixel conventions reuse the file's measured helpers: bilinear taps through
+ * mbx_bilinear_coordinate, modulation through mbx_modulate_vertex_colour and
+ * blending through mbx_source_over_clamped, so a form that happens to be
+ * decodable by both paths draws the same pixels through either.
+ *
+ * Depth: a flat scene (every z equal and every rw 1) draws in submission
+ * order, exactly like the strict rect path. A scene with varying z or rw
+ * gets a per-scene depth buffer with GL_LESS semantics, cleared at each
+ * STARTRENDER -- the single-scene-per-clear assumption matches how a GLES1
+ * frame is normally produced. It is a heuristic, and it says so here.
+ * =================================================================== */
+#define MBX_HLE_MAX_VERTICES 256u
+
+struct mbx_hle_vertex {
+    float    x, y, z, rw;
+    float    u, v;
+    uint32_t colour;
+};
+
+struct mbx_hle_texture {
+    bool     present;
+    bool     filtered;
+    uint32_t source;         /* GPU address of texel (0,0) */
+    uint32_t source_stride;  /* bytes per texel row */
+    uint32_t width;
+    uint32_t height;
+};
+
+struct mbx_hle_prim {
+    uint32_t                vertex_count;
+    struct mbx_hle_vertex  *vertices;
+    struct mbx_hle_texture  texture;
+};
+
+/* One decoded (header, source, sampler) triple. The measured layout:
+ * header  width field bits 24-26, height bits 20-22, pitch bit 0;
+ * source  filtered bit 31, pitch bits 16-21, 18-bit GPU address.
+ * HLE accepts any triple whose fields decode, without the expected-value
+ * match the strict decoder requires. */
+static bool mbx_hle_texture_words(uint32_t header, uint32_t source_word,
+                                  struct mbx_hle_texture *texture) {
+    if ((header >> 29) != 5u || (source_word & 0x0f000000u) != 0x0e000000u)
+        return false;
+    uint32_t width = 8u << ((header >> 24) & 7u);
+    uint32_t height = 8u << ((header >> 20) & 7u);
+    uint32_t pitch_units = ((source_word >> 16) & 0xfcu) |
+                           ((header & 1u) << 1);
+    if (!pitch_units || width > 512u || height > 512u) return false;
+    texture->present = true;
+    texture->filtered = (source_word & 0x80000000u) != 0u;
+    texture->source = mbx_3d_decode_address(source_word);
+    texture->source_stride = pitch_units * 16u;
+    texture->width = width;
+    texture->height = height;
+    return true;
+}
+
+/* The scene-level origin from a 0xa0000003 transform block. The strict form
+ * is an orthographic scale/translate pair; HLE reads the four floats that
+ * matter and falls back to a zero origin when the block is another shape,
+ * rather than rejecting the scene for it. */
+static void mbx_hle_global_origin(const uint32_t *words, uint32_t index,
+                                   uint32_t target_width, uint32_t target_height,
+                                   float *origin_x, float *origin_y) {
+    float sx = 0.0f, tx = 0.0f, sy = 0.0f, ty = 0.0f;
+    if (index + 16u <= UINT32_MAX &&
+        mbx_3d_word_to_finite_float(words[index + 1u], &sx) &&
+        mbx_3d_word_to_finite_float(words[index + 4u], &tx) &&
+        mbx_3d_word_to_finite_float(words[index + 6u], &sy) &&
+        mbx_3d_word_to_finite_float(words[index + 8u], &ty) &&
+        sx != 0.0f && sy != 0.0f && target_width && target_height) {
+        /* The measured form stores sx = 2/width and sy = 2/height, so
+         * (tx+1)/sx is exactly the strict parser's (tx+1)*width/2 origin. */
+        *origin_x = (tx + 1.0f) / sx;
+        *origin_y = (ty + 1.0f) / sy;
+    } else {
+        *origin_x = 0.0f;
+        *origin_y = 0.0f;
+    }
+}
+
+/* Stage one texture into host memory. The whole texture is read once per
+ * primitive that references it, before any destination byte is touched, so
+ * a texture that aliases the framebuffer still samples the pre-draw pixels
+ * for that primitive -- the same staging discipline the strict path holds. */
+static uint8_t *mbx_hle_stage_texture(const s5l_mbx_t *m, const arm_bus_t *bus,
+                                      const struct mbx_hle_texture *texture,
+                                      const char **why) {
+    uint64_t bytes = (uint64_t)texture->source_stride * texture->height;
+    if (!bytes || bytes > 2u * 1024u * 1024u ||
+        (uint64_t)texture->source + bytes > (uint64_t)UINT32_MAX + 1u) {
+        if (why) *why = "HLE texture span is invalid";
+        return NULL;
+    }
+    uint8_t *pixels = malloc((size_t)bytes);
+    if (!pixels) {
+        if (why) *why = "HLE texture allocation failed";
+        return NULL;
+    }
+    if (!mbx_gart_read(m, bus, texture->source, pixels, (uint32_t)bytes, why)) {
+        free(pixels);
+        return NULL;
+    }
+    return pixels;
+}
+
+static uint32_t mbx_hle_sample_nearest(const uint8_t *pixels,
+                                       const struct mbx_hle_texture *texture,
+                                       float u, float v) {
+    if (u < 0.0f) u = 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (u > (float)(texture->width - 1u))
+        u = (float)(texture->width - 1u);
+    if (v > (float)(texture->height - 1u))
+        v = (float)(texture->height - 1u);
+    uint32_t x = (uint32_t)u;
+    uint32_t y = (uint32_t)v;
+    if (x >= texture->width) x = texture->width - 1u;
+    if (y >= texture->height) y = texture->height - 1u;
+    return mbx_load_le32(pixels + y * texture->source_stride + x * 4u);
+}
+
+static uint32_t mbx_hle_sample_bilinear(const uint8_t *pixels,
+                                        const struct mbx_hle_texture *texture,
+                                        float u, float v) {
+    struct mbx_bilinear_axis axis_x, axis_y;
+    if (!mbx_bilinear_coordinate(u, texture->width, &axis_x) ||
+        !mbx_bilinear_coordinate(v, texture->height, &axis_y))
+        return 0u;
+    uint32_t top_left = mbx_load_le32(
+        pixels + axis_y.first * texture->source_stride + axis_x.first * 4u);
+    uint32_t bottom_left = mbx_load_le32(
+        pixels + axis_y.second * texture->source_stride + axis_x.first * 4u);
+    uint32_t top_right = mbx_load_le32(
+        pixels + axis_y.first * texture->source_stride + axis_x.second * 4u);
+    uint32_t bottom_right = mbx_load_le32(
+        pixels + axis_y.second * texture->source_stride + axis_x.second * 4u);
+    uint32_t left = top_left == bottom_left ? top_left : mbx_linear_bgra8(
+        top_left, bottom_left, axis_y.weight);
+    uint32_t right = top_right == bottom_right ? top_right : mbx_linear_bgra8(
+        top_right, bottom_right, axis_y.weight);
+    return left == right ? left : mbx_linear_bgra8(left, right, axis_x.weight);
+}
+
+/* Blend one source pixel over one destination pixel in the staged target.
+ * Both paths premultiply-modulate first, matching the strict path's
+ * mbx_modulate_vertex_colour + mbx_source_over_clamped pair. */
+static void mbx_hle_blend_pixel(uint8_t *destination, uint32_t source_pixel,
+                                uint32_t vertex_colour) {
+    uint32_t modulated = mbx_modulate_vertex_colour(source_pixel,
+                                                    vertex_colour);
+    uint32_t output = mbx_source_over_clamped(mbx_load_le32(destination),
+                                              modulated);
+    destination[0] = (uint8_t)output;
+    destination[1] = (uint8_t)(output >> 8);
+    destination[2] = (uint8_t)(output >> 16);
+    destination[3] = (uint8_t)(output >> 24);
+}
+
+/* Interpolate one vertex attribute pair over a triangle at barycentric
+ * weights (w0,w1,w2). Colour interpolation is linear (Gouraud); UV and
+ * reciprocal-w use the perspective-correct form when the weights of w differ. */
+static uint32_t mbx_hle_interpolate_colour(const struct mbx_hle_vertex *a,
+                                           const struct mbx_hle_vertex *b,
+                                           const struct mbx_hle_vertex *c,
+                                           float w0, float w1, float w2) {
+    uint32_t blue = (uint32_t)((float)(a->colour & 0xffu) * w0 +
+                               (float)(b->colour & 0xffu) * w1 +
+                               (float)(c->colour & 0xffu) * w2);
+    uint32_t green = (uint32_t)(((a->colour >> 8) & 0xffu) * w0 +
+                                ((b->colour >> 8) & 0xffu) * w1 +
+                                ((c->colour >> 8) & 0xffu) * w2);
+    uint32_t red = (uint32_t)(((a->colour >> 16) & 0xffu) * w0 +
+                              ((b->colour >> 16) & 0xffu) * w1 +
+                              ((c->colour >> 16) & 0xffu) * w2);
+    uint32_t alpha = (uint32_t)((a->colour >> 24) * w0 +
+                                (b->colour >> 24) * w1 +
+                                (c->colour >> 24) * w2);
+    if (blue > 255u) blue = 255u;
+    if (green > 255u) green = 255u;
+    if (red > 255u) red = 255u;
+    if (alpha > 255u) alpha = 255u;
+    return blue | (green << 8) | (red << 16) | (alpha << 24);
+}
+
+static void mbx_hle_perspective_uv(const struct mbx_hle_vertex *a,
+                                   const struct mbx_hle_vertex *b,
+                                   const struct mbx_hle_vertex *c,
+                                   float w0, float w1, float w2,
+                                   float *u, float *v) {
+    float uw = a->u * a->rw * w0 + b->u * b->rw * w1 + c->u * c->rw * w2;
+    float vw = a->v * a->rw * w0 + b->v * b->rw * w1 + c->v * c->rw * w2;
+    float rw = a->rw * w0 + b->rw * w1 + c->rw * w2;
+    if (rw > 0.0f) {
+        *u = uw / rw;
+        *v = vw / rw;
+    } else {
+        *u = a->u;
+        *v = a->v;
+    }
+}
+
+/* Rasterise one triangle of a primitive into the staged target. The edge
+ * functions accept both windings; the fill rule is the pixel centre test
+ * used throughout this file (centre at +0.5, inclusive bounds). */
+static bool mbx_hle_raster_triangle(
+        const struct mbx_hle_vertex *a, const struct mbx_hle_vertex *b,
+        const struct mbx_hle_vertex *c,
+        const struct mbx_hle_texture *texture, const uint8_t *texture_pixels,
+        uint8_t *target_pixels, uint32_t target_width, uint32_t target_height,
+        uint32_t clip_left, uint32_t clip_top,
+        uint32_t clip_right, uint32_t clip_bottom,
+        float *depth, bool depth_test, uint64_t *pixels_blended,
+        uint32_t *dirty_left, uint32_t *dirty_top,
+        uint32_t *dirty_right, uint32_t *dirty_bottom) {
+    float min_x = a->x < b->x ? a->x : b->x;
+    if (c->x < min_x) min_x = c->x;
+    float max_x = a->x > b->x ? a->x : b->x;
+    if (c->x > max_x) max_x = c->x;
+    float min_y = a->y < b->y ? a->y : b->y;
+    if (c->y < min_y) min_y = c->y;
+    float max_y = a->y > b->y ? a->y : b->y;
+    if (c->y > max_y) max_y = c->y;
+
+    int32_t left = mbx_3d_ceil_to_i32(min_x - 0.5f);
+    int32_t top = mbx_3d_ceil_to_i32(min_y - 0.5f);
+    int32_t right = mbx_3d_ceil_to_i32(max_x - 0.5f);
+    int32_t bottom = mbx_3d_ceil_to_i32(max_y - 0.5f);
+    if (left < (int32_t)clip_left) left = (int32_t)clip_left;
+    if (top < (int32_t)clip_top) top = (int32_t)clip_top;
+    if (right > (int32_t)clip_right) right = (int32_t)clip_right;
+    if (bottom > (int32_t)clip_bottom) bottom = (int32_t)clip_bottom;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int32_t)target_width) right = (int32_t)target_width;
+    if (bottom > (int32_t)target_height) bottom = (int32_t)target_height;
+    if (left >= right || top >= bottom) return true;
+
+    float area = (b->x - a->x) * (c->y - a->y) -
+                 (b->y - a->y) * (c->x - a->x);
+    if (area == 0.0f) return true;
+    bool wrote_any = false;
+
+    for (int32_t py = top; py < bottom; py++) {
+        for (int32_t px = left; px < right; px++) {
+            float cx = (float)px + 0.5f;
+            float cy = (float)py + 0.5f;
+            float e0 = (b->x - a->x) * (cy - a->y) -
+                       (b->y - a->y) * (cx - a->x);
+            float e1 = (c->x - b->x) * (cy - b->y) -
+                       (c->y - b->y) * (cx - b->x);
+            float e2 = (a->x - c->x) * (cy - c->y) -
+                       (a->y - c->y) * (cx - c->x);
+            /* One winding makes all three edge values share the area's sign. */
+            bool inside = area > 0.0f
+                ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+            if (!inside) continue;
+
+            float w0 = e1 / area;
+            float w1 = e2 / area;
+            float w2 = e0 / area;
+            if (w0 < 0.0f) w0 = 0.0f;
+            if (w1 < 0.0f) w1 = 0.0f;
+            if (w2 < 0.0f) w2 = 0.0f;
+
+            if (depth) {
+                float z = a->z * w0 + b->z * w1 + c->z * w2;
+                uint32_t index = (uint32_t)py * target_width + (uint32_t)px;
+                if (depth_test && z >= depth[index]) continue;
+                depth[index] = z;
+            }
+
+            uint32_t colour = mbx_hle_interpolate_colour(a, b, c, w0, w1, w2);
+            uint8_t *destination = target_pixels +
+                ((uint32_t)py * target_width + (uint32_t)px) * 4u;
+            if (texture && texture_pixels) {
+                float u = 0.0f, v = 0.0f;
+                mbx_hle_perspective_uv(a, b, c, w0, w1, w2, &u, &v);
+                uint32_t source_pixel = texture->filtered
+                    ? mbx_hle_sample_bilinear(texture_pixels, texture, u, v)
+                    : mbx_hle_sample_nearest(texture_pixels, texture, u, v);
+                mbx_hle_blend_pixel(destination, source_pixel, colour);
+            } else {
+                uint32_t modulated = 0u;
+                uint32_t blue = colour & 0xffu;
+                uint32_t green = (colour >> 8) & 0xffu;
+                uint32_t red = (colour >> 16) & 0xffu;
+                uint32_t alpha = colour >> 24;
+                if (blue > alpha) blue = alpha;
+                if (green > alpha) green = alpha;
+                if (red > alpha) red = alpha;
+                modulated = blue | (green << 8) | (red << 16) | (alpha << 24);
+                uint32_t output = mbx_source_over_clamped(
+                    mbx_load_le32(destination), modulated);
+                destination[0] = (uint8_t)output;
+                destination[1] = (uint8_t)(output >> 8);
+                destination[2] = (uint8_t)(output >> 16);
+                destination[3] = (uint8_t)(output >> 24);
+            }
+            (*pixels_blended)++;
+            wrote_any = true;
+        }
+    }
+    if (wrote_any) {
+        if ((uint32_t)left < *dirty_left) *dirty_left = (uint32_t)left;
+        if ((uint32_t)top < *dirty_top) *dirty_top = (uint32_t)top;
+        if ((uint32_t)right > *dirty_right) *dirty_right = (uint32_t)right;
+        if ((uint32_t)bottom > *dirty_bottom) *dirty_bottom = (uint32_t)bottom;
+    }
+    return true;
+}
+/*
+ * Decode the vertices of one primitive beginning at `cursor` (already past
+ * the 0x48020000 boundary and the control word). A vertex's word zero is the
+ * measured zero pad; the terminator is the marker word 2 or 3, which cannot
+ * alias a vertex because every measured vertex starts with zero. Returns the
+ * number of vertices decoded, or 0 when the first word is not a vertex.
+ * Vertices with a non-finite coordinate, a non-positive reciprocal w or a
+ * zero pad are the HLE "skip" case: the primitive is dropped, not the scene.
+ */
+static uint32_t mbx_hle_read_vertices(const uint32_t *words, uint32_t count,
+                                      uint32_t cursor, uint32_t stride,
+                                      struct mbx_hle_vertex *out,
+                                      uint32_t max) {
+    uint32_t decoded = 0u;
+    while (decoded < max && cursor + stride <= count - 1u) {
+        uint32_t base = cursor;
+        if (words[base] == 2u || words[base] == 3u) break;
+        if (words[base] == 0x10000004u || words[base] == 0x48020000u ||
+            words[base] == 0xa0000003u || words[base] == 0xa01b001cu)
+            break;
+        struct mbx_hle_vertex vertex;
+        if (words[base] != 0u ||
+            !mbx_3d_word_to_finite_float(words[base + 1u], &vertex.x) ||
+            !mbx_3d_word_to_finite_float(words[base + 2u], &vertex.y) ||
+            !mbx_3d_word_to_finite_float(words[base + 3u], &vertex.z) ||
+            !mbx_3d_word_to_finite_float(words[base + 4u], &vertex.rw) ||
+            vertex.rw <= 0.0f || vertex.rw > 1024.0f)
+            break;
+        vertex.colour = words[base + 5u];
+        vertex.u = 0.0f;
+        vertex.v = 0.0f;
+        if (stride == 8u &&
+            (!mbx_3d_word_to_finite_float(words[base + 6u], &vertex.u) ||
+             !mbx_3d_word_to_finite_float(words[base + 7u], &vertex.v)))
+            break;
+        out[decoded] = vertex;
+        decoded++;
+        cursor += stride;
+    }
+    return decoded;
+}
+
+/* The best-effort scene pass. Everything before the primitive walk -- capture
+ * slot, register set, staging and commit -- is the strict path's own
+ * discipline, copied exactly; only the parser and the rasteriser generalise.
+ * Returns true only after decoded pixels committed through the GART. */
+static bool mbx_execute_ta_hle_stream(s5l_mbx_t *m, const arm_bus_t *bus,
+                                      const char **why,
+                                      uint32_t *pixels_blended,
+                                      struct mbx_ta_rejection_diagnostic
+                                          *diagnostic) {
+    if (diagnostic) {
+        diagnostic->word_count = 0u;
+        diagnostic->failure_word = UINT32_MAX;
+    }
+    uint32_t capture = *mbx_ta_capture_slot(m);
+    if ((capture & MBX_TA_CAPTURE_MAGIC_M) != MBX_TA_CAPTURE_MAGIC) {
+        if (why) *why = "HLE found no complete staged TA stream";
+        return false;
+    }
+    uint32_t count = capture & MBX_TA_CAPTURE_COUNT_M;
+    if (diagnostic) diagnostic->word_count = count;
+    uint32_t object = m->reg[S5L_MBX_OBJBASE / 4u];
+    uint32_t target = m->reg[S5L_MBX_FBSTART / 4u];
+    if (count < 3u || count > MBX_TA_CAPTURE_MAX_WORDS ||
+        !object || object != m->reg[S5L_MBX_TA_OBJECT_DATABASE / 4u] ||
+        m->reg[S5L_MBX_RGNBASE / 4u] !=
+            m->reg[S5L_MBX_TA_REGION_BASE / 4u]) {
+        if (why) *why = "HLE staged TA stream does not belong to this render";
+        return false;
+    }
+    uint32_t framebuffer_control = m->reg[S5L_MBX_FBCTL / 4u];
+    bool bgra8_control = framebuffer_control == 0x00000006u ||
+                         framebuffer_control == 0x0000000eu;
+    if ((object & 3u) || (target & 3u) ||
+        m->reg[S5L_MBX_3DPIXSAMP / 4u] != 0x00020007u ||
+        !bgra8_control) {
+        if (why) *why = "HLE TA render registers are outside the measured BGRA8 form";
+        return false;
+    }
+    uint32_t xclip = m->reg[S5L_MBX_FBXCLIP / 4u];
+    uint32_t yclip = m->reg[S5L_MBX_FBYCLIP / 4u];
+    uint32_t clip_left = xclip & 0xffffu;
+    uint32_t clip_top = yclip & 0xffffu;
+    uint32_t clip_right = (xclip >> 16) + 1u;
+    uint32_t clip_bottom = (yclip >> 16) + 1u;
+    uint32_t target_width = m->reg[S5L_MBX_FBLINESTRIDE / 4u];
+    uint32_t target_height = clip_bottom;
+    if (!target_width || target_width > MBX_TA_MAX_WIDTH ||
+        clip_left >= clip_right || clip_right > target_width ||
+        clip_top >= clip_bottom || target_height > 480u) {
+        if (why) *why = "HLE TA framebuffer stride or clip is invalid";
+        return false;
+    }
+    uint32_t target_bytes = target_width * target_height * 4u;
+    if (target > UINT32_MAX - target_bytes) {
+        if (why) *why = "HLE TA framebuffer target span overflows";
+        return false;
+    }
+
+    uint32_t byte_count = count * 4u;
+    uint32_t *words = malloc(byte_count);
+    if (!words) {
+        if (why) *why = "HLE host allocation for staged TA stream failed";
+        return false;
+    }
+    {
+        const char *read_why = "HLE staged TA stream read failed";
+        uint8_t *raw = malloc(byte_count);
+        if (!raw) {
+            free(words);
+            if (why) *why = "HLE host allocation for staged TA stream failed";
+            return false;
+        }
+        bool ok = mbx_gart_read(m, bus, object, raw, byte_count, &read_why);
+        for (uint32_t i = 0u; i < count && ok; i++)
+            words[i] = mbx_load_le32(raw + i * 4u);
+        free(raw);
+        if (!ok || words[0] != 0x10000010u ||
+            words[count - 1u] != S5L_MBX_3D_SUBMIT) {
+            free(words);
+            if (ok && why)
+                *why = "HLE TA stream framing is unknown or incomplete";
+            return false;
+        }
+    }
+
+    /* Pass one: decode primitives. The vertex arena is bounded by the word
+     * count itself (six words per vertex is the smallest stride), so the
+     * stream cannot overflow it. */
+    uint32_t arena_max = count / 6u + 1u;
+    struct mbx_hle_vertex *arena =
+        malloc(arena_max * sizeof *arena);
+    uint32_t prim_max = count / 7u + 1u;
+    struct mbx_hle_prim *prims = malloc(prim_max * sizeof *prims);
+    uint32_t prim_count = 0u, arena_used = 0u;
+    uint32_t skipped_words = 0u, skipped_prims = 0u;
+    bool flat_scene = true;
+    float origin_x = 0.0f, origin_y = 0.0f;
+    struct mbx_hle_texture texture = {0};
+    uint32_t last_stride = 0u;
+    if (!arena || !prims) {
+        free(words); free(arena); free(prims);
+        if (why) *why = "HLE host allocation for decoded scene failed";
+        return false;
+    }
+
+    uint32_t cursor = 1u;
+    while (cursor < count - 1u) {
+        uint32_t w = words[cursor];
+        if (w == 0x10000010u) {
+            cursor++;
+            continue;
+        }
+        if (w == 0xa0000003u && cursor + 16u < count - 1u) {
+            mbx_hle_global_origin(words, cursor, target_width,
+                                  target_height, &origin_x, &origin_y);
+            cursor += 17u;
+            continue;
+        }
+        if (w == 0xa01b001cu && mbx_ta_state_block(words, count, cursor)) {
+            cursor += MBX_TA_STATE_WORDS;
+            continue;
+        }
+        if (w == 0x10000073u) {
+            uint32_t auxiliary = mbx_ta_auxiliary_block(words, count, cursor);
+            cursor += auxiliary ? auxiliary : 1u;
+            if (!auxiliary) skipped_words++;
+            continue;
+        }
+        if (w == 0x10000004u) {
+            /* An object header: scan ahead for the texture triple and the
+             * vertex boundary. Unknown object forms are skipped word by word. */
+            uint32_t scan = cursor + 1u;
+            uint32_t limit = cursor + 16u;
+            if (limit > count - 1u) limit = count - 1u;
+            for (; scan + 2u < limit; scan++) {
+                if (words[scan] == 0x48020000u) break;
+                struct mbx_hle_texture candidate;
+                if (mbx_hle_texture_words(words[scan], words[scan + 1u],
+                                          &candidate))
+                    texture = candidate;
+            }
+            cursor++;
+            continue;
+        }
+        if (w == 0x48020000u || w == 2u || w == 3u) {
+            if (w == 2u || w == 3u) cursor++;
+            if (cursor < count - 1u && words[cursor] == 0x48020000u)
+                cursor++;
+            uint32_t control = cursor < count - 1u ? words[cursor] : 0u;
+            uint32_t stride = 0u;
+            if ((control & ~0x40u) == 0xf0020004u) {
+                stride = (control & 0x40u) ? 8u : 6u;
+                cursor++;
+            } else if (last_stride) {
+                stride = last_stride;
+            } else {
+                cursor++;
+                skipped_words++;
+                continue;
+            }
+            last_stride = stride;
+            uint32_t available = arena_max - arena_used;
+            if (available > MBX_HLE_MAX_VERTICES)
+                available = MBX_HLE_MAX_VERTICES;
+            uint32_t decoded = mbx_hle_read_vertices(
+                words, count, cursor, stride,
+                arena + arena_used, available);
+            if (decoded < 3u) {
+                skipped_prims++;
+                cursor += decoded * stride;
+                continue;
+            }
+            cursor += decoded * stride;
+            struct mbx_hle_prim *prim = &prims[prim_count];
+            prim->vertex_count = decoded;
+            prim->vertices = arena + arena_used;
+            prim->texture = texture;
+            if (stride == 6u) prim->texture.present = false;
+            for (uint32_t v = 0u; v < decoded; v++) {
+                prim->vertices[v].x += origin_x;
+                prim->vertices[v].y += origin_y;
+                if (prim->vertices[v].z != 0.0f ||
+                    prim->vertices[v].rw != 1.0f)
+                    flat_scene = false;
+            }
+            arena_used += decoded;
+            prim_count++;
+            if (prim_count >= prim_max) {
+                if (mbx_trace_state == 1)
+                    fprintf(stderr,
+                            "MBX3D HLE primitive table full at %u\n",
+                            prim_count);
+                break;
+            }
+            continue;
+        }
+        /* Unknown word: the liveness skip this whole policy exists for. */
+        cursor++;
+        skipped_words++;
+    }
+
+    if (!prim_count) {
+        free(words); free(arena); free(prims);
+        if (why) *why = "HLE decoded no drawable primitive";
+        if (diagnostic) diagnostic->failure_word = cursor;
+        if (mbx_trace_state == 1 && (skipped_words || skipped_prims))
+            fprintf(stderr,
+                    "MBX3D HLE skipped %u words and %u primitives\n",
+                    skipped_words, skipped_prims);
+        return false;
+    }
+
+    uint8_t *target_pixels = malloc(target_bytes);
+    float *depth = flat_scene ? NULL : malloc((size_t)target_width *
+                                               target_height * sizeof *depth);
+    if (!target_pixels || (!flat_scene && !depth)) {
+        free(words); free(arena); free(prims);
+        free(target_pixels); free(depth);
+        if (why) *why = "HLE host allocation for staged target failed";
+        return false;
+    }
+    {
+        const char *read_why = "HLE staged target read failed";
+        if (!mbx_gart_read(m, bus, target, target_pixels, target_bytes,
+                           &read_why)) {
+            free(words); free(arena); free(prims);
+            free(target_pixels); free(depth);
+            if (why) *why = read_why;
+            return false;
+        }
+    }
+    if (depth)
+        for (uint32_t i = 0u;
+             i < target_width * target_height; i++)
+            depth[i] = 1e30f;
+
+    uint8_t *staged_texture = NULL;
+    struct mbx_hle_texture staged = {0};
+    uint32_t dirty_left = target_width, dirty_top = target_height;
+    uint32_t dirty_right = 0u, dirty_bottom = 0u;
+    uint64_t total_pixels = 0u;
+    for (uint32_t p = 0u; p < prim_count; p++) {
+        struct mbx_hle_prim *prim = &prims[p];
+        if (prim->texture.present) {
+            if (!staged_texture || staged.source != prim->texture.source ||
+                staged.source_stride != prim->texture.source_stride ||
+                staged.width != prim->texture.width ||
+                staged.height != prim->texture.height) {
+                free(staged_texture);
+                staged_texture = mbx_hle_stage_texture(
+                    m, bus, &prim->texture, why);
+                staged = prim->texture;
+                if (!staged_texture) {
+                    skipped_prims++;
+                    continue;
+                }
+            }
+        }
+        for (uint32_t t = 1u; t + 1u < prim->vertex_count; t++) {
+            /* Fan triangulation: (0, t, t+1). The rasteriser merges each
+             * triangle's clipped bounds into the commit rectangle itself. */
+            (void)mbx_hle_raster_triangle(
+                &prim->vertices[0], &prim->vertices[t],
+                &prim->vertices[t + 1u],
+                prim->texture.present ? &prim->texture : NULL,
+                staged_texture, target_pixels, target_width, target_height,
+                clip_left, clip_top, clip_right, clip_bottom,
+                depth, !flat_scene, &total_pixels,
+                &dirty_left, &dirty_top, &dirty_right, &dirty_bottom);
+        }
+    }
+    free(staged_texture);
+    free(arena);
+    free(prims);
+
+    if (!total_pixels || total_pixels > UINT32_MAX) {
+        free(words); free(target_pixels); free(depth);
+        if (why) *why = "HLE scene covers no pixels";
+        return false;
+    }
+
+    uint32_t dirty_row_bytes = dirty_right > dirty_left
+        ? (dirty_right - dirty_left) * 4u : 0u;
+    bool ok = true;
+    for (uint32_t row = dirty_top; row < dirty_bottom && ok; row++)
+        ok = mbx_gart_validate(m, bus,
+            target + row * target_width * 4u + dirty_left * 4u,
+            dirty_row_bytes, why);
+    for (uint32_t row = dirty_top; row < dirty_bottom && ok; row++) {
+        uint32_t offset = row * target_width * 4u + dirty_left * 4u;
+        ok = mbx_gart_write(m, bus, target + offset,
+                            target_pixels + offset, dirty_row_bytes, why);
+    }
+    free(target_pixels);
+    free(depth);
+    free(words);
+    if (!ok) return false;
+    if (pixels_blended) *pixels_blended = (uint32_t)total_pixels;
+    if (mbx_trace_state == 1)
+        fprintf(stderr,
+                "MBX3D HLE stream accepted: %u prims, %u pixels,"
+                " skipped %u words / %u prims, %s\n",
+                prim_count, (uint32_t)total_pixels, skipped_words,
+                skipped_prims, flat_scene ? "flat" : "depth-tested");
+    return true;
+}
+
 bool s5l_mbx_process_3d(s5l_mbx_t *m, const arm_bus_t *bus,
                         uint32_t written_off, uint32_t value,
                         s5l_mbx_telemetry_t *telemetry) {
@@ -5177,6 +5871,19 @@ bool s5l_mbx_process_3d(s5l_mbx_t *m, const arm_bus_t *bus,
         kind = S5L_MBX_3D_ACCEPT_TA_STREAM;
         accepted = mbx_execute_ta_stream(
             m, bus, &ta_why, &pixels, &ta_diagnostic);
+    }
+    if (!accepted && m->hle_renderer) {
+        /*
+         * The best-effort general renderer: only forms the strict families
+         * rejected reach this, and it never claims the exactly-modelled
+         * paths above it. A false return leaves the rejection untouched.
+         */
+        const char *hle_why = "unknown HLE rejection";
+        accepted = mbx_execute_ta_hle_stream(
+            m, bus, &hle_why, &pixels, &ta_diagnostic);
+        if (!accepted && mbx_trace_state == 1)
+            fprintf(stderr, "MBX3D hle: %s\n", hle_why);
+        kind = S5L_MBX_3D_ACCEPT_TA_HLE;
     }
     if (!accepted) {
         mbx_counter_add(&mbx_3d_rejected, 1u);
@@ -5264,6 +5971,12 @@ bool s5l_mbx_set_degraded_completion(s5l_mbx_t *m, bool enabled) {
     return true;
 }
 
+bool s5l_mbx_set_hle_renderer(s5l_mbx_t *m, bool enabled) {
+    if (!m) return false;
+    m->hle_renderer = enabled;
+    return true;
+}
+
 void s5l_mbx_reset(s5l_mbx_t *m) {
     if (!m) return;
     /*
@@ -5279,9 +5992,11 @@ void s5l_mbx_reset(s5l_mbx_t *m) {
      */
     uint8_t *edram = m->edram;
     bool complete_rejected_submits = m->complete_rejected_submits;
+    bool hle_renderer = m->hle_renderer;
     memset(m, 0, sizeof *m);
     m->edram = edram;
     m->complete_rejected_submits = complete_rejected_submits;
+    m->hle_renderer = hle_renderer;
     if (edram) memset(edram, 0, S5L_MBX_EDRAM_SIZE);
 }
 

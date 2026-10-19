@@ -29,7 +29,8 @@ typedef enum {
     /* The stock pppd launchd job, written into a new work image. */
     MAP_PROVISION_PPP,
     /* The live host NAT, conditional on that recorded PPP job. */
-    MAP_RUNTIME_NAT,
+    MAP_RUNTIME_NAT,    /* The live best-effort 3D renderer, conditional on the MBX nub. */
+    MAP_RUNTIME_MBX_HLE,
     /* A device-tree nub. Set means "leave it matched"; clear un-matches it
      * through s5l_bringup_request_t::unmatch. */
     MAP_UNMATCH,
@@ -70,6 +71,7 @@ static const struct {
      * reset, ring, 2D and 3D families. It remains opt-in until a final cold
      * boot and a measured product-level cadence close the graphics gate. */
     { "mbx", MAP_UNMATCH, NULL, "arm-io/mbx" },
+    { "mbx-hle", MAP_RUNTIME_MBX_HLE, NULL, NULL },
     /* Matched, IOCryptoAcceleratorFamily installs a sha1_hardware_hook and
      * every exactly-4096-byte digest -- the size cs_validate_page asks for --
      * goes to a register file this VM does not model. launchd's first text
@@ -356,6 +358,17 @@ void vm_boot_options_apply(const bool *values, unsigned count,
                 row->effective = row->requested && link;
                 row->note = link ? NULL :
                     "Requires PPP in this machine's work image.";
+                report->applied++;
+                break;
+            }
+            case MAP_RUNTIME_MBX_HLE: {
+                int mbx = vm_option_index("mbx");
+                bool graphics = mbx >= 0 &&
+                    requested_value(values, count, (unsigned)mbx);
+                row->outcome = VM_BOOT_OPTION_APPLIED;
+                row->effective = row->requested && graphics;
+                row->note = (row->requested && !graphics) ?
+                    "Requires the MBX graphics switch in Guest hardware." : NULL;
                 report->applied++;
                 break;
             }

@@ -39,6 +39,7 @@ static const struct {
     unsigned    impl;
 } EXPECTED[] = {
     { "mbx", EXPECTED_MBX_DEFAULT, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
+    { "mbx-hle",             false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     { "sha1",               false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     { "baseband",           false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     { "spi2",               false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
@@ -229,7 +230,8 @@ static void test_new_machine_defaults(void) {
     for (unsigned i = 0; i < vm_option_count(); i++) {
         const vm_option_t *row = vm_option_at(i);
         bool expected = row->def;
-        if (!strcmp(row->name, "mbx") || !strcmp(row->name, "ppp") ||
+        if (!strcmp(row->name, "mbx") || !strcmp(row->name, "mbx-hle") ||
+            !strcmp(row->name, "ppp") ||
             !strcmp(row->name, "usb-otg"))
             expected = true;
         else if (!strcmp(row->name, "ca-software-render")) expected = false;
@@ -244,7 +246,8 @@ static void test_new_machine_defaults(void) {
     }
     CHECK(values[vm_option_index("nat")], "guest internet routing must default on");
     CHECK(values[vm_option_index("usb-otg")], "live IPA transport must default on");
-    expect_command_line(values, "--mbx --usb-otg --no-ca-software-render --ppp",
+    expect_command_line(values,
+                        "--mbx --mbx-hle --usb-otg --no-ca-software-render --ppp",
                         "product defaults render exact desktop replay flags");
     CHECK(!vm_option_new_machine_value(vm_option_count(), false, true),
           "invalid default index resolved");

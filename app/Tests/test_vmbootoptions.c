@@ -140,13 +140,13 @@ static void test_applied_rows_reach_the_request(void) {
           "turning memory-reg off did not set no_memory_node");
     CHECK(!report.row[lcd].effective && !report.row[mem].effective,
           "a row turned off still reports as effective");
-    /* The two request opt-outs, the SIX nubs, and live NAT are applied rows.
-     * Counted rather than left open so that
+    /* The two request opt-outs, the SIX nubs, live NAT and the MBX HLE
+     * renderer are applied rows. Counted rather than left open so that
      * a row quietly joining them has to be a deliberate edit here -- which is
-     * what this is: `multitouch` was added on 2026-07-29 and it is applied
-     * like the rest, even at its default, because "left matched because you
-     * asked for it" is the switch working rather than being ignored. */
-    CHECK(report.applied == 9u, "%u rows applied, expected 9", report.applied);
+     * what this is: `mbx-hle` was added on 2026-10-19 and it is applied like
+     * the rest, even at its default, because "armed only when you asked for
+     * it" is the switch working rather than being ignored. */
+    CHECK(report.applied == 10u, "%u rows applied, expected 10", report.applied);
 
     /* Nothing else in the request may be touched. no_framebuffer in
      * particular: the app never turns the display off, and a mapping that

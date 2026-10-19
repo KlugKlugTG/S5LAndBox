@@ -1836,6 +1836,192 @@ static void test_ta_stream_perspective_texture(void) {
     s5l8900_free(&m);
 }
 
+static void test_ta_hle_general_triangle(void) {
+    enum {
+        WIDTH = 64u,
+        HEIGHT = 32u,
+        TARGET_BYTES = WIDTH * HEIGHT * 4u,
+        SOURCE_STRIDE = 64u,
+        SOURCE_HEIGHT = 32u,
+    };
+    const uint32_t table0 = 0x08002000u;
+    const uint32_t table2 = 0x08003000u;
+    const uint32_t object = 0x00100000u;
+    const uint32_t region = 0x00040000u;
+    const uint32_t source = 0x00820000u;
+    const uint32_t target = 0x00840000u;
+    const uint32_t source_word = 0x8e040000u |
+        ((source >> 7) & 0x0003ffffu);
+
+    /* A GLES1-style triangle: three vertices, per-vertex colour, uniform
+     * reciprocal w. No strict family has ever measured a three-vertex
+     * primitive with a marker-3 terminator, so the stream is a rejection
+     * everywhere the best-effort renderer is not armed. */
+    uint32_t stream[64] = {0x10000010u};
+    uint32_t next = test_ta_global_transform(
+        stream, 1u, WIDTH, HEIGHT, 0.0f, 0.0f);
+    stream[next++] = 0x10000004u;
+    stream[next++] = 0xa1218000u;
+    stream[next++] = source_word;
+    stream[next++] = 0x86084610u;
+    stream[next++] = 0x48020000u;
+    stream[next++] = 0xf0020044u;
+    const float vx[3] = {8.0f, 24.0f, 8.0f};
+    const float vy[3] = {4.0f, 4.0f, 12.0f};
+    const float vu[3] = {0.0f, 16.0f, 0.0f};
+    const float vv[3] = {0.0f, 0.0f, 8.0f};
+    const uint32_t vcol[3] = {0xff808080u, 0xff402010u, 0xff102040u};
+    for (uint32_t vertex = 0u; vertex < 3u; vertex++) {
+        stream[next++] = 0u;
+        stream[next++] = test_float_word(vx[vertex]);
+        stream[next++] = test_float_word(vy[vertex]);
+        stream[next++] = 0u;                 /* z = 0 */
+        stream[next++] = 0x3f800000u;        /* 1/w = 1 */
+        stream[next++] = vcol[vertex];
+        stream[next++] = test_float_word(vu[vertex]);
+        stream[next++] = test_float_word(vv[vertex]);
+    }
+    stream[next++] = 3u;
+    stream[next++] = 0xf0000000u;
+
+    /* Pass one: the toggle is host policy and the core default is off, so the
+     * strict families alone must reject the triangle and touch nothing. */
+    s5l8900_t plain;
+    CHECK(s5l8900_init(&plain, RAM_BASE, RAM_SIZE),
+          "HLE A/B machine init failed");
+    if (!plain.ram) return;
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_GART0, table0);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_GART2, table2);
+    test_map_gpu_page(&plain, table0, object, 0x08010000u);
+    test_map_gpu_page(&plain, table2, source, 0x08030000u);
+    for (uint32_t page = 0u; page < TARGET_BYTES; page += 0x1000u)
+        test_map_gpu_page(&plain, table2, target + page, 0x08040000u + page);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_TA_DB, object);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_TA_REGION, region);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_RGNBASE, region);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_OBJBASE, object);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_PIXSAMP, 0x00020007u);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_FBCTL, 6u);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_FBXCLIP, 0x003f0000u);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_FBYCLIP, 0x001f0000u);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_FBSTART, target);
+    plain.bus.write32(plain.bus.ctx, MBX_BASE + REG_FBSTRIDE, WIDTH);
+    test_ta_run_stream(&plain, stream, next);
+    CHECK(plain.bus.read32(plain.bus.ctx, MBX_BASE + REG_STATUS) == 0u &&
+          plain.mbx_telemetry.candidates_3d == 1u &&
+          plain.mbx_telemetry.completed_3d == 0u &&
+          plain.mbx_telemetry.rejected_3d == 1u,
+          "the default renderer accepted an unmeasured triangle");
+    s5l8900_free(&plain);
+
+    /* Pass two: arm the best-effort renderer, then rerun the same stream. */
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, RAM_BASE, RAM_SIZE),
+          "HLE triangle machine init failed");
+    if (!m.ram) return;
+    CHECK(s5l_mbx_set_hle_renderer(&m.mbx, true),
+          "arming the HLE renderer failed");
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_GART0, table0);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_GART2, table2);
+    test_map_gpu_page(&m, table0, object, 0x08010000u);
+    test_map_gpu_page(&m, table2, source, 0x08030000u);
+    for (uint32_t page = 0u; page < TARGET_BYTES; page += 0x1000u)
+        test_map_gpu_page(&m, table2, target + page, 0x08040000u + page);
+    for (uint32_t row = 0u; row < SOURCE_HEIGHT; row++)
+        for (uint32_t column = 0u; column < SOURCE_STRIDE / 4u; column++)
+            test_gpu_write32(&m, source + row * SOURCE_STRIDE + column * 4u,
+                             test_sprite_source_pixel(column, row));
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_TA_DB, object);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_TA_REGION, region);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_RGNBASE, region);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_OBJBASE, object);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_PIXSAMP, 0x00020007u);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_FBCTL, 6u);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_FBXCLIP, 0x003f0000u);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_FBYCLIP, 0x001f0000u);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_FBSTART, target);
+    m.bus.write32(m.bus.ctx, MBX_BASE + REG_FBSTRIDE, WIDTH);
+    test_ta_run_stream(&m, stream, next);
+
+    /* The triangle's barycentric fill, written out here so the expectation is
+     * an independent scalar restatement of the renderer's documented rule:
+     * pixel centre inside all three edges, Gouraud colour, perspective UV
+     * (trivial at w = 1), bilinear tap, modulation over the zeroed target. */
+    const float ax = vx[0], ay = vy[0], bx = vx[1], by = vy[1];
+    const float cx = vx[2], cy = vy[2];
+    const float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    uint32_t mismatches = 0u, covered = 0u;
+    for (uint32_t py = 0u; py < HEIGHT; py++) {
+        for (uint32_t px = 0u; px < WIDTH; px++) {
+            const float cxp = (float)px + 0.5f;
+            const float cyp = (float)py + 0.5f;
+            const float e0 = (bx - ax) * (cyp - ay) -
+                             (by - ay) * (cxp - ax);
+            const float e1 = (cx - bx) * (cyp - by) -
+                             (cy - by) * (cxp - bx);
+            const float e2 = (ax - cx) * (cyp - cy) -
+                             (ay - cy) * (cxp - cx);
+            const bool inside = area > 0.0f
+                ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+            uint32_t expected = 0u;
+            if (inside && area != 0.0f) {
+                const float w0 = e1 / area, w1 = e2 / area, w2 = e0 / area;
+                const float u = vu[0] * w0 + vu[1] * w1 + vu[2] * w2;
+                const float v = vv[0] * w0 + vv[1] * w1 + vv[2] * w2;
+                struct test_bilinear_axis sx, sy;
+                CHECK(test_bilinear_coordinate(u, SOURCE_STRIDE / 4u, &sx) &&
+                      test_bilinear_coordinate(v, SOURCE_HEIGHT, &sy),
+                      "triangle UV fell outside the source at %u,%u", px, py);
+                uint32_t blue = (uint32_t)(
+                    (float)(vcol[0] & 0xffu) * w0 +
+                    (float)(vcol[1] & 0xffu) * w1 +
+                    (float)(vcol[2] & 0xffu) * w2);
+                uint32_t green = (uint32_t)(
+                    (float)((vcol[0] >> 8) & 0xffu) * w0 +
+                    (float)((vcol[1] >> 8) & 0xffu) * w1 +
+                    (float)((vcol[2] >> 8) & 0xffu) * w2);
+                uint32_t red = (uint32_t)(
+                    (float)((vcol[0] >> 16) & 0xffu) * w0 +
+                    (float)((vcol[1] >> 16) & 0xffu) * w1 +
+                    (float)((vcol[2] >> 16) & 0xffu) * w2);
+                uint32_t alpha = (uint32_t)(
+                    (float)(vcol[0] >> 24) * w0 +
+                    (float)(vcol[1] >> 24) * w1 +
+                    (float)(vcol[2] >> 24) * w2);
+                if (blue > 255u) blue = 255u;
+                if (green > 255u) green = 255u;
+                if (red > 255u) red = 255u;
+                if (alpha > 255u) alpha = 255u;
+                const uint32_t colour = blue | (green << 8) |
+                                        (red << 16) | (alpha << 24);
+                expected = test_modulate_vertex_colour(
+                    test_bilinear_sprite_pixel(&sx, &sy), colour);
+                covered++;
+            }
+            mismatches += test_gpu_read32(
+                &m, target + (py * WIDTH + px) * 4u) != expected;
+        }
+    }
+    CHECK(mismatches == 0u,
+          "%u HLE triangle pixels mismatched the scalar reference",
+          mismatches);
+    CHECK(m.bus.read32(m.bus.ctx, MBX_BASE + REG_STATUS) == 0x4cu &&
+          m.mbx_telemetry.candidates_3d == 1u &&
+          m.mbx_telemetry.completed_3d == 1u &&
+          m.mbx_telemetry.rejected_3d == 0u &&
+          m.mbx_telemetry.pixels_3d == covered,
+          "HLE triangle telemetry is not exact");
+
+    /* The policy survives a device reset without travelling in one. */
+    s5l_mbx_reset(&m.mbx);
+    CHECK(m.mbx.hle_renderer,
+          "the HLE renderer policy did not survive a device reset");
+    CHECK(s5l_mbx_set_hle_renderer(&m.mbx, false) && !m.mbx.hle_renderer,
+          "the HLE renderer policy could not be disarmed");
+    s5l8900_free(&m);
+}
+
 static void test_ta_stream_immediate_state_reuse_and_alias_bounds(void) {
     enum {
         WIDTH = 64u,
@@ -7418,6 +7604,7 @@ int main(void) {
     test_ta_stream_voice_memos_near_unity_rotation();
     test_ta_stream_weather_marker2_quads();
     test_ta_stream_perspective_texture();
+    test_ta_hle_general_triangle();
     test_ta_stream_immediate_state_reuse_and_alias_bounds();
     test_premultiplied_2d_clock_form();
     test_opaque_global_alpha_2d_form();

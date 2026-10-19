@@ -22,6 +22,16 @@ static const vm_option_t VM_OPTIONS[] = {
       "experimental: undecoded submits may complete without pixels, and "
       "original-device responsiveness is not established.",
       false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
+    { "mbx-hle", "MBX best-effort 3D renderer (HLE)  ·  general submits",
+      "On for new machines. Draws the 3D submits the exact families reject -- "
+      "arbitrary triangle lists, Gouraud colour, perspective texturing -- so "
+      "GLES1 game scenes render instead of completing without pixels. Never "
+      "runs before the exact paths, so every matched UI form stays pixel-"
+      "exact, and it cannot corrupt memory: unknown stream words are skipped "
+      "and counted, not failed. Host render policy, not guest state: not "
+      "stored in a snapshot, and changing it needs a restart, not a new "
+      "image.",
+      false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
     { "sha1", "SHA-1 engine  ·  /arm-io/sha1",
       "Off: matched, every 4096-byte cs_validate_page digest goes to an "
       "unmodelled register file and launchd's first text page fails signing.",
@@ -193,7 +203,8 @@ bool vm_option_new_machine_value(unsigned index, bool has_saved_value,
     const vm_option_t *option = vm_option_at(index);
     if (!option) return false;
     if (has_saved_value) return saved_value;
-    if (!strcmp(option->name, "mbx") || !strcmp(option->name, "ppp") ||
+    if (!strcmp(option->name, "mbx") || !strcmp(option->name, "mbx-hle") ||
+        !strcmp(option->name, "ppp") ||
         !strcmp(option->name, "usb-otg"))
         return true;
     if (!strcmp(option->name, "ca-software-render")) return false;

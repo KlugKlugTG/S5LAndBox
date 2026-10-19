@@ -426,6 +426,7 @@ static bool boot_option_takes_value(const char *option) {
 typedef struct {
     /* guest hardware: device-tree nubs this VM hides unless asked not to */
     bool mbx;
+    bool mbx_hle;
     bool sha1;
     bool baseband;
     bool spi2;
@@ -495,6 +496,12 @@ static const boot_toggle_t BOOT_TOGGLES[] = {
       "the nub is un-matched by default. -g is NOT an alias for this row: it\n"
       "has always also implied --framebuffer and --iomfb-display, so it stays\n"
       "a compound (see below) and --mbx alone is the narrow form." },
+    { "mbx-hle", NULL, NULL, false, BOOT_GROUP_HARDWARE, BOOT_FIELD(mbx_hle),
+      "arm the best-effort general 3D renderer for the MBX above. It only\n"
+      "ever sees submits every exactly-modelled family rejected, so it\n"
+      "cannot change an exact path; unknown stream words are skipped and\n"
+      "counted rather than failing the scene. Host render policy, applied\n"
+      "once before bring-up and deliberately not machine state." },
     { "sha1", "-S", NULL, false, BOOT_GROUP_HARDWARE, BOOT_FIELD(sha1),
       "leave /arm-io/sha1 matched. IOCryptoAcceleratorFamily installs a\n"
       "sha1_hardware_hook, after which every exactly-4096-byte digest --\n"
@@ -35455,6 +35462,13 @@ int main(int argc, char **argv) {
     g_virt_base = virt_base;
     g_phys_base = phys_base;
     g_ram_size = ram_size;
+
+    /* Host render policy for the MBX, resolved once like every toggle: the
+     * best-effort general 3D renderer only ever sees submits the exact
+     * families rejected, so arming it cannot change a matched UI form. It is
+     * not machine state and deliberately does not travel in a checkpoint. */
+    if (cfg.v.mbx_hle)
+        (void)s5l_mbx_set_hle_renderer(&mach.mbx, true);
 
     boot_range_t dram_range, kernel_range;
     uint64_t kernel_begin64, kernel_end64;

@@ -1753,6 +1753,26 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
         return false;
     }
 
+    /*
+     * The best-effort general 3D renderer rides the same host-policy rules:
+     * armed only for this app's effective MBX row, deliberately absent from
+     * guest snapshots, and applied after every restore/fresh-boot branch. It
+     * only ever sees submits the exactly-modelled families rejected, so a
+     * stream the strict tables decode still renders pixel-exact.
+     */
+    int mbx_hle_index = vm_option_index("mbx-hle");
+    bool mbx_hle_effective = mbx_hle_index >= 0 &&
+        (unsigned)mbx_hle_index < report->options.count &&
+        report->options.row[mbx_hle_index].effective;
+    if (!s5l_mbx_set_hle_renderer(&machine->mbx, mbx_hle_effective)) {
+        (void)file_block_close(boot->media);
+        set_detail(report->detail, sizeof report->detail,
+                   "The MBX general-renderer policy could not be applied.");
+        set_detail(report->summary, sizeof report->summary,
+                   "MBX general renderer unavailable");
+        return false;
+    }
+
 #if defined(S5LBOX_IOS_ACTIVE_REALTIME_CLOCK)
     /*
      * Arm this after restore so the first host sample anchors the restored
