@@ -175,9 +175,10 @@ class EngineRepository(private val handle: Long) {
     /** The switches plus what the machine's image can actually deliver. */
     fun machineOptions(id: String): MachineOptions {
         val o = json(NativeEngine.nativeMachineOptionsJson(handle, id))
-        val array = o.optJSONArray("values") ?: BooleanArray(0)
+        val array = o.optJSONArray("values")
         return MachineOptions(
-            values = BooleanArray(array.length()) { array.optBoolean(it, false) },
+            values = array?.let { BooleanArray(it.length()) { i -> it.optBoolean(i, false) } }
+                ?: BooleanArray(0),
             pppProvisioned = o.optBoolean("pppProvisioned", false),
             diskGiB = o.optLong("diskGiB", 0L),
         )
